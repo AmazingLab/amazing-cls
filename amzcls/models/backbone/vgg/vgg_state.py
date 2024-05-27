@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from spikingjelly.activation_based import layer, functional
 
-from ..builder import MODELS
-from ...neurons import NODES, build_node
+from ...builder import MODELS
+from ....neurons import NODES, build_node
 
 
 class CBS(nn.Module):

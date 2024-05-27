@@ -3,8 +3,8 @@ import torch.nn as nn
 from spikingjelly.activation_based import layer, functional
 
 from .sew_resnet import SEWBottleneck, SEWBasicBlock, model_urls, conv1x1
-from ..builder import MODELS, BACKBONES
-from ...neurons import build_node, NODES
+from ...builder import MODELS, BACKBONES
+from ....neurons import build_node, NODES
 
 try:
     from torchvision.models.utils import load_state_dict_from_url

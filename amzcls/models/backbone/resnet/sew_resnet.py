@@ -2,8 +2,8 @@ import torch.nn as nn
 from mmpretrain.models.backbones.base_backbone import BaseBackbone
 from spikingjelly.activation_based import layer, functional
 
-from ..builder import MODELS, BACKBONES
-from ...neurons import build_node, NODES
+from ...builder import MODELS, BACKBONES
+from ....neurons import build_node, NODES
 
 try:
     from torchvision.models.utils import load_state_dict_from_url
@@ -95,6 +95,10 @@ class SEWBasicBlock(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
         out = self.sn2(out)
+        from amzcls.utils.etc import get_entropy
+        sorted_counter, r = get_entropy(out)
+        print(r)
+        print(sorted_counter)
         out = self.cnf(identity, out)
         return out
 
@@ -363,6 +367,7 @@ class SEWResNet(BaseBackbone):
         self.bn1 = norm_layer(self.inplanes)
         self.sn1 = build_node(neuron_cfg)
         self.maxpool = layer.AvgPool2d(kernel_size=3, stride=2, padding=1)
+
         self.layer1 = self._make_layer(
             block, width[0], layers[0], stride[0], cnf_list=cnf_list, neuron_cfg=neuron_cfg)
         self.layer2 = self._make_layer(block, width[1], layers[1], stride[1], dilate=replace_stride_with_dilation[0],
@@ -431,6 +436,8 @@ class SEWResNet(BaseBackbone):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
+
+        exit(0)
         return x,
 
     def forward(self, x):

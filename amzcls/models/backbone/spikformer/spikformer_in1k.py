@@ -4,15 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from spikingjelly.activation_based import layer, functional
+from timm.layers import DropPath
 
 from amzcls.models.builder import BACKBONES
 from amzcls.neurons import build_node, NODES
 from amzcls.neurons.layer import LayerNorm
 from ..utils.timm import to_2tuple, trunc_normal_, _cfg
 
-__all__ = ['spikformer_cifar', 'SpikformerCifar']
-
-default_neuron = dict(type='LIFNode', tau=2.0, detach_reset=True)
+__all__ = ['SpikformerImageNet', 'spikformer_in1k']
 
 
 class MLP(nn.Module):
@@ -20,13 +19,14 @@ class MLP(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1_conv = layer.Conv1d(in_features, hidden_features, kernel_size=1, stride=1)
-        self.fc1_bn = layer.BatchNorm1d(hidden_features)
+        self.fc1_conv = layer.Conv2d(in_features, hidden_features, kernel_size=1, stride=1)
+        self.fc1_bn = layer.BatchNorm2d(hidden_features)
         self.fc1_lif = build_node(neuron_cfg)
 
-        self.fc2_conv = layer.Conv1d(hidden_features, out_features, kernel_size=1, stride=1)
-        self.fc2_bn = layer.BatchNorm1d(out_features)
+        self.fc2_conv = layer.Conv2d(hidden_features, out_features, kernel_size=1, stride=1)
+        self.fc2_bn = layer.BatchNorm2d(out_features)
         self.fc2_lif = build_node(neuron_cfg)
+
         self.c_hidden = hidden_features
         self.c_output = out_features
 
@@ -34,6 +34,7 @@ class MLP(nn.Module):
         x = self.fc1_conv(x)
         x = self.fc1_bn(x)
         x = self.fc1_lif(x)
+
         x = self.fc2_conv(x)
         x = self.fc2_bn(x)
         x = self.fc2_lif(x)
@@ -47,7 +48,6 @@ class SSA(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.scale = 0.125
-
         self.q_conv = layer.Conv1d(dim, dim, kernel_size=1, stride=1, bias=False)
         self.q_bn = layer.BatchNorm1d(dim)
         self.q_lif = build_node(neuron_cfg)
@@ -59,56 +59,61 @@ class SSA(nn.Module):
         self.v_conv = layer.Conv1d(dim, dim, kernel_size=1, stride=1, bias=False)
         self.v_bn = layer.BatchNorm1d(dim)
         self.v_lif = build_node(neuron_cfg)
-
         self.attn_lif = build_node({**neuron_cfg, 'v_threshold': 0.5})
+
         self.proj_conv = layer.Conv1d(dim, dim, kernel_size=1, stride=1)
         self.proj_bn = layer.BatchNorm1d(dim)
         self.proj_lif = build_node(neuron_cfg)
 
-    def forward(self, x):
+    def forward(self, x, res_attn):
+        T, B, C, H, W = x.shape
+        x = x.flatten(3)
         T, B, C, N = x.shape
         x_for_qkv = x
-        q_conv_out = self.q_lif(self.q_bn(self.q_conv(x_for_qkv)))
+        q_conv_out = self.q_conv(x_for_qkv)
+        q_conv_out = self.q_bn(q_conv_out)
+        q_conv_out = self.q_lif(q_conv_out)
         q = q_conv_out.transpose(-1, -2).reshape(
             T, B, N, self.num_heads, C // self.num_heads
         ).permute(0, 1, 3, 2, 4).contiguous()
 
-        k_conv_out = self.k_lif(self.k_bn(self.k_conv(x_for_qkv)))
+        k_conv_out = self.k_conv(x_for_qkv)
+        k_conv_out = self.k_bn(k_conv_out)
+        k_conv_out = self.k_lif(k_conv_out)
         k = k_conv_out.transpose(-1, -2).reshape(
             T, B, N, self.num_heads, C // self.num_heads
         ).permute(0, 1, 3, 2, 4).contiguous()
 
-        v_conv_out = self.v_lif(self.v_bn(self.v_conv(x_for_qkv)))
+        v_conv_out = self.v_conv(x_for_qkv)
+        v_conv_out = self.v_bn(v_conv_out)
+        v_conv_out = self.v_lif(v_conv_out)
         v = v_conv_out.transpose(-1, -2).reshape(
             T, B, N, self.num_heads, C // self.num_heads
         ).permute(0, 1, 3, 2, 4).contiguous()
 
-        attn = (q @ k.transpose(-2, -1))
-        x = (attn @ v) * self.scale
-
-        x = x.reshape(T, B, N, C).transpose(2, 3)
+        x = (q @ (k.transpose(-2, -1) @ v)) * self.scale
+        x = x.transpose(3, 4).reshape(T, B, C, N).contiguous()
         x = self.attn_lif(x)
-        x = self.proj_lif(self.proj_bn(self.proj_conv(x)))
-        return x
+        x = self.proj_lif(self.proj_bn(self.proj_conv(x)).reshape(T, B, C, H, W))
+        return x, v
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., norm_layer=LayerNorm, neuron_cfg=None):
+    def __init__(self, dim, num_heads, mlp_ratio=4., drop_path=0., norm_layer=LayerNorm, neuron_cfg=None):
         super().__init__()
-        self.norm1 = norm_layer(dim, step_mode='m')
         self.attn = SSA(dim, num_heads=num_heads, neuron_cfg=neuron_cfg)
-        self.norm2 = norm_layer(dim, step_mode='m')
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, neuron_cfg=neuron_cfg)
 
-    def forward(self, x):
-        x = x + self.attn(x)
-        x = x + self.mlp(x)
-        return x
+    def forward(self, x, res_attn):
+        x_attn, attn = self.attn(x, res_attn)
+        x = x + x_attn
+        x = x + (self.mlp(x))
+        return x, attn
 
 
 class SPS(nn.Module):
-    def __init__(self, img_size_h=128, img_size_w=128, patch_size=4, in_channels=2, embed_dims=256,
+    def __init__(self, img_size_h=224, img_size_w=224, patch_size=4, in_channels=3, embed_dims=256,
                  neuron_cfg=None):
         super().__init__()
         self.image_size = [img_size_h, img_size_w]
@@ -117,30 +122,27 @@ class SPS(nn.Module):
         self.C = in_channels
         self.H, self.W = self.image_size[0] // patch_size[0], self.image_size[1] // patch_size[1]
         self.num_patches = self.H * self.W
-        self.proj_conv = layer.Conv2d(
-            in_channels, embed_dims // 8, kernel_size=(3, 3), stride=(1, 1), padding=1, bias=False)
+        self.proj_conv = layer.Conv2d(in_channels, embed_dims // 8, kernel_size=3, stride=1, padding=1, bias=False)
         self.proj_bn = layer.BatchNorm2d(embed_dims // 8)
         self.proj_lif = build_node(neuron_cfg)
+        self.maxpool = layer.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
 
-        self.proj_conv1 = layer.Conv2d(
-            embed_dims // 8, embed_dims // 4, kernel_size=(3, 3), stride=(1, 1), padding=1, bias=False)
+        self.proj_conv1 = layer.Conv2d(embed_dims // 8, embed_dims // 4, kernel_size=3, stride=1, padding=1, bias=False)
         self.proj_bn1 = layer.BatchNorm2d(embed_dims // 4)
         self.proj_lif1 = build_node(neuron_cfg)
+        self.maxpool1 = layer.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
 
-        self.proj_conv2 = layer.Conv2d(
-            embed_dims // 4, embed_dims // 2, kernel_size=(3, 3), stride=(1, 1), padding=1, bias=False)
+        self.proj_conv2 = layer.Conv2d(embed_dims // 4, embed_dims // 2, kernel_size=3, stride=1, padding=1, bias=False)
         self.proj_bn2 = layer.BatchNorm2d(embed_dims // 2)
         self.proj_lif2 = build_node(neuron_cfg)
         self.maxpool2 = layer.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
 
-        self.proj_conv3 = layer.Conv2d(
-            embed_dims // 2, embed_dims, kernel_size=(3, 3), stride=(1, 1), padding=1, bias=False)
+        self.proj_conv3 = layer.Conv2d(embed_dims // 2, embed_dims, kernel_size=3, stride=1, padding=1, bias=False)
         self.proj_bn3 = layer.BatchNorm2d(embed_dims)
         self.proj_lif3 = build_node(neuron_cfg)
         self.maxpool3 = layer.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
 
-        self.rpe_conv = layer.Conv2d(
-            embed_dims, embed_dims, kernel_size=3, stride=1, padding=1, bias=False)
+        self.rpe_conv = layer.Conv2d(embed_dims, embed_dims, kernel_size=3, stride=1, padding=1, bias=False)
         self.rpe_bn = layer.BatchNorm2d(embed_dims)
         self.rpe_lif = build_node(neuron_cfg)
 
@@ -149,10 +151,12 @@ class SPS(nn.Module):
         x = self.proj_conv(x)
         x = self.proj_bn(x)
         x = self.proj_lif(x)
+        x = self.maxpool(x)
 
         x = self.proj_conv1(x)
         x = self.proj_bn1(x)
         x = self.proj_lif1(x)
+        x = self.maxpool1(x)
 
         x = self.proj_conv2(x)
         x = self.proj_bn2(x)
@@ -164,24 +168,32 @@ class SPS(nn.Module):
         x = self.proj_lif3(x)
         x = self.maxpool3(x)
 
-        x_rpe = self.rpe_bn(self.rpe_conv(x))
-        x_rpe = self.rpe_lif(x_rpe)
-        x = x + x_rpe
-        x = x.flatten(-2).contiguous()
+        x_feat = x
+        x = self.rpe_conv(x)
+        x = self.rpe_bn(x)
+        x = self.rpe_lif(x)
+        x = x + x_feat
         return x
 
 
+default_neuron = dict(type='LIFNode', tau=2.0, detach_reset=True)
+
+
 @BACKBONES.register_module()
-class SpikformerCifar(nn.Module):
-    def __init__(self, img_size_h=32, img_size_w=32, patch_size=4, in_channels=3, embed_dims=384,
-                 num_heads=12, mlp_ratios=4, norm_layer=None, depths=4, neuron_cfg=None):
+class SpikformerImageNet(nn.Module):
+    def __init__(
+            self, img_size_h=224, img_size_w=224, patch_size=16, in_channels=3,
+            embed_dims=512, num_heads=8, mlp_ratios=4, drop_path_rate=0.2,
+            norm_layer=partial(LayerNorm, eps=1e-6), depths=8, neuron_cfg=None
+    ):
         super().__init__()
         if neuron_cfg is None:
             print(f"[INFO] Using default neuron `{default_neuron}`.\n"
                   "\tfrom `amzcls.models.backbones.spikformer_dvs`.")
             neuron_cfg = default_neuron
         self.depths = depths
-        norm_layer = partial(LayerNorm, eps=1e-6) if norm_layer is None else norm_layer
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depths)]  # stochastic depth decay rule
 
         patch_embed = SPS(img_size_h=img_size_h,
                           img_size_w=img_size_w,
@@ -191,13 +203,16 @@ class SpikformerCifar(nn.Module):
                           neuron_cfg=neuron_cfg)
 
         block = nn.ModuleList([Block(
-            dim=embed_dims, num_heads=num_heads, mlp_ratio=mlp_ratios, norm_layer=norm_layer, neuron_cfg=neuron_cfg)
+            dim=embed_dims, num_heads=num_heads, mlp_ratio=mlp_ratios, drop_path=dpr[j],
+            norm_layer=norm_layer, neuron_cfg=neuron_cfg)
             for j in range(depths)])
 
         setattr(self, f"patch_embed", patch_embed)
         setattr(self, f"block", block)
 
+        # classification head
         self.apply(self._init_weights)
+
         functional.set_step_mode(self, 'm')
         functional.set_backend(self, backend='cupy', instance=NODES.get(neuron_cfg['type']))
 
@@ -220,25 +235,29 @@ class SpikformerCifar(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward_features(self, x):
+
         block = getattr(self, f"block")
         patch_embed = getattr(self, f"patch_embed")
+
         x = patch_embed(x)
+        attn = None
         for blk in block:
-            x = blk(x)
+            x, attn = blk(x, attn)
         return x
 
     def forward(self, x):
         functional.reset_net(self)
         x = self.forward_features(x)
-        return x.mean(3),
+        return x,
 
 
 @BACKBONES.register_module()
-def spikformer_cifar(**kwargs):
-    model = SpikformerCifar(
-        patch_size=4, embed_dims=384, num_heads=12, mlp_ratios=4,
-        in_channels=3, norm_layer=partial(LayerNorm, eps=1e-6), depths=4,
-        **kwargs
+def spikformer_in1k(
+        img_size_h=224, img_size_w=224, patch_size=16, in_channels=3, num_classes=1000, embed_dims=512,
+        num_heads=8, mlp_ratios=4, drop_path_rate=0.2, norm_layer=partial(LayerNorm, eps=1e-6), depths=8):
+    model = SpikformerImageNet(
+        img_size_h, img_size_w, patch_size, in_channels, num_classes, embed_dims,
+        num_heads, mlp_ratios, drop_path_rate, norm_layer, depths,
     )
     model.default_cfg = _cfg()
     return model

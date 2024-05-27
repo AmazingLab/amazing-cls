@@ -7,8 +7,8 @@ from spikingjelly.activation_based import layer, functional
 
 from amzcls.models.builder import BACKBONES
 from amzcls.neurons import build_node, NODES
-from amzcls.neurons.layer import LayerNorm, TimeEfficientLayerNorm, TimeEfficientBatchNorm2d
-from .utils import to_2tuple, trunc_normal_, _cfg
+from amzcls.neurons.layer import LayerNorm, TimeEfficientBatchNorm2d
+from ..utils.timm import to_2tuple, trunc_normal_, _cfg
 
 __all__ = ['spikformer_dvs', 'SpikformerDVS']
 
@@ -256,16 +256,3 @@ def spikformer_dvs(norm_layer, **kwargs):
     )
     model.default_cfg = _cfg()
     return model
-
-
-@BACKBONES.register_module()
-def spikformer_teln_dvs(teln_step, norm_layer, **kwargs):
-    # delete norm_layer
-    model = SpikformerDVS(
-        norm_layer=partial(TimeEfficientLayerNorm, time_step=teln_step, eps=1e-6),
-        **kwargs
-    )
-    model.default_cfg = _cfg()
-    return model
-
-

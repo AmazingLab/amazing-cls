@@ -3,9 +3,9 @@ import torch.nn as nn
 from mmpretrain.models.backbones.base_backbone import BaseBackbone
 from spikingjelly.activation_based import layer, functional
 
-from ..builder import MODELS
-from ...neurons import build_node, NODES
-from ...neurons.layer import TimeEfficientBatchNorm2d
+from ...builder import MODELS
+from ....neurons import build_node, NODES
+from ....neurons.layer import TimeEfficientBatchNorm2d
 
 
 class CBS(nn.Module):
@@ -82,6 +82,11 @@ class VGG11(BaseBackbone):
     def _forward_impl(self, x):
         functional.reset_net(self)
         x = self.layer1(x)
+        from amzcls.utils.etc import get_entropy
+        sorted_counter, r = get_entropy(x)
+        print(x.mean())
+        print(r)
+        print(len(sorted_counter))
         x = self.mpool1(x)
         x = self.layer2(x)
         x = self.mpool2(x)

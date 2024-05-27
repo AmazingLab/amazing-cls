@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 from spikingjelly.activation_based import layer, functional
 
-from .ta_resnet import TSVec
+from ..resnet.ta_resnet import TSVec
 from .vgg import make_layers
-from ..builder import MODELS
-from ...neurons import NODES
+from ...builder import MODELS
+from ....neurons import NODES
 
 default_neuron = dict(type='IFNode')
 default_width = [64, 128, 256, 512]
